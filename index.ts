@@ -204,6 +204,10 @@ export default function (pi: ExtensionAPI) {
         "rec",
         [
           "-q", // quiet
+          // Shrink sox's IO buffer so stdout flushes ~every 16ms instead of
+          // the default ~256ms. 512 bytes = 256 samples = 16ms at 16kHz/16-bit
+          // mono. This is the dominant source of meter latency.
+          "--buffer", "512",
           "-r", "16000",
           "-c", "1",
           "-b", "16",
