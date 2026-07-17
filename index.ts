@@ -3,7 +3,22 @@
  *
  * Press alt+m to start, press it again to stop.
  * Press alt+n to cancel and discard the in-flight transcript.
- * On stop, the finalized transcript is appended to the pi input editor.
+ *
+ * Focus-aware: alt+m/alt+n are intercepted at the TUI input layer (before any
+ * focused component), so dictation works inside ANY dialog — quiz popups,
+ * ask_user_question, ctx.ui.editor()/input() — not just the main chat editor.
+ *
+ * Start rule: dictation only begins if some text-capable component is
+ * focused; otherwise an ephemeral notification explains why nothing happened.
+ * Opaque dialogs (quiz/ask selects) count as text-capable, but their internal
+ * focus is invisible to us — Tab into the note/Other field first so the text
+ * lands there.
+ *
+ * Stop rule: the delivery target is resolved fresh at stop time and the
+ * transcript goes to whatever is focused THEN (editor-like components get a
+ * direct setText append; opaque components get synthetic keystrokes). If
+ * nothing text-capable is focused at stop, the transcript is copied to the
+ * clipboard and a notification says so — a finished dictation is never lost.
  *
  * Requires:
  *   - sox installed (`brew install sox` — provides the `rec` command)
@@ -17,8 +32,20 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key } from "@earendil-works/pi-tui";
+import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { appendFileSync } from "node:fs";
+
+// Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
+// lifecycle events (listener hits, toggles, ws open/error/close with their
+// generation) to /tmp/dictate-debug.log.
+const DEBUG = !!process.env.DICTATE_DEBUG;
+const dbg = (msg: string) => {
+  if (!DEBUG) return;
+  try {
+    appendFileSync("/tmp/dictate-debug.log", `${new Date().toISOString()} ${msg}\n`);
+  } catch {}
+};
 
 // Deepgram streaming endpoint. Tuning notes:
 //   model=nova-3        — flagship, sub-300ms latency, best accuracy
@@ -40,6 +67,27 @@ const DG_URL =
   "&endpointing=300";
 
 type State = "idle" | "recording" | "stopping";
+
+// ── Focus-aware delivery ──────────────────────────────────────────────────
+// The TUI handle is captured once via a zero-height widget factory (the only
+// extension-API surface that exposes it). With it we can:
+//   1. Listen to ALL terminal input via tui.addInputListener — listeners run
+//      before the focused component, so alt+m works even while a custom
+//      dialog has stolen focus from the main editor (extension shortcuts are
+//      otherwise only matched by the main editor component).
+//   2. Inspect tui.focusedComponent to decide where the transcript goes.
+// `focusedComponent` is declared private in the typings but is a plain
+// runtime property — a benign peek, easily patched if pi internals change.
+interface EditorLike {
+  getText(): string;
+  setText(text: string): void;
+}
+type Target =
+  | { kind: "editor"; editor: EditorLike }
+  | { kind: "typable"; component: { handleInput(data: string): void } };
+
+const asEditorLike = (value: any): EditorLike | null =>
+  value && typeof value.getText === "function" && typeof value.setText === "function" ? value : null;
 
 // Same braille frames pi-tui's Loader uses.
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -90,6 +138,12 @@ export default function (pi: ExtensionAPI) {
   let stopTimeout: NodeJS.Timeout | null = null;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let spinnerFrame = 0;
+  // Session generation: incremented on every start and every cleanup. All
+  // rec/ws event handlers capture the generation they belong to and no-op
+  // when it's stale — otherwise a PREVIOUS session's socket erroring/closing
+  // late (e.g. one we aborted mid-handshake) would run cleanup() and tear
+  // down the CURRENT live session.
+  let generation = 0;
   // Audio meter state. `meter` is a ring of recent RMS values, newest at
   // index METER_CELLS-1. `currentLevel` is the most recent RMS observed from
   // any audio chunk — the meter tick just samples it. Crucially we never reset
@@ -123,7 +177,15 @@ export default function (pi: ExtensionAPI) {
     stopMeter();
     meter = new Array(METER_CELLS).fill(0);
     currentLevel = 0;
-    const render = () => setStatus(`🔴 ${meter.map(rmsToBlock).join("")} listening…`);
+    // Recording dot: a text glyph colored via the theme, not an emoji — emoji
+    // presentation renders double-width in its own baked-in color and visually
+    // shouts in the footer. `●` is the same dot pi's own docs use for
+    // indicators; theme "error" gives the red. (If you ever want strictly
+    // ASCII, swap the glyph for "O".)
+    const render = () => {
+      const dot = activeCtx?.ui.theme.fg("error", "●") ?? "●";
+      setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening…`);
+    };
     render();
     meterTimer = setInterval(() => {
       meter.shift();
@@ -143,18 +205,71 @@ export default function (pi: ExtensionAPI) {
     }, SPINNER_INTERVAL_MS);
   };
 
+  let tuiHandle: any = null;
+  let removeInputListener: (() => void) | null = null;
+  let lastCtx: ExtensionContext | null = null;
+
+  /** Resolve where dictated text would go RIGHT NOW, based on keyboard focus. */
+  const resolveTarget = (): Target | null => {
+    const focused = tuiHandle?.focusedComponent;
+    if (!focused) return null;
+    // Editor-like focus: the main chat editor, custom editors, and the
+    // ctx.ui.editor()/input() popups (their inner pi-tui Editor hangs off
+    // `.editor`). These accept a guaranteed direct setText append.
+    const editor = asEditorLike(focused) ?? asEditorLike(focused.editor);
+    if (editor) return { kind: "editor", editor };
+    // Opaque component with input handling (quiz/ask selects, selectors):
+    // we can type into it, but whether the text lands depends on its
+    // internal focus (e.g. the quiz note field must be Tab-focused).
+    if (typeof focused.handleInput === "function") return { kind: "typable", component: focused };
+    return null;
+  };
+
   const flush = () => {
     if (flushed || !activeCtx) return;
     flushed = true;
     if (cancelled) return; // discard transcript on cancel
     const text = finals.join(" ").replace(/\s+/g, " ").trim();
     if (!text) return;
-    const current = activeCtx.ui.getEditorText() ?? "";
-    const sep = current && !/\s$/.test(current) ? " " : "";
-    activeCtx.ui.setEditorText(current + sep + text);
+
+    // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
+    // append to the main chat editor exactly as before.
+    if (!tuiHandle) {
+      const current = activeCtx.ui.getEditorText() ?? "";
+      const sep = current && !/\s$/.test(current) ? " " : "";
+      activeCtx.ui.setEditorText(current + sep + text);
+      return;
+    }
+
+    // Resolve the target NOW — focus may have changed while dictating.
+    const target = resolveTarget();
+    if (target?.kind === "editor") {
+      const current = target.editor.getText() ?? "";
+      const sep = current && !/\s$/.test(current) ? " " : "";
+      target.editor.setText(current + sep + text);
+      tuiHandle.requestRender?.();
+      return;
+    }
+    if (target?.kind === "typable") {
+      // Synthetic typing: the component routes the text wherever its
+      // internal focus is. Text is plain printable words (whitespace
+      // already normalized), so no keybindings/autocomplete can trigger.
+      target.component.handleInput(text);
+      tuiHandle.requestRender?.();
+      return;
+    }
+    // Nothing to type into: don't throw the transcript away — stash it on
+    // the clipboard and say so.
+    try {
+      const p = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+      p.stdin.end(text);
+    } catch {}
+    activeCtx.ui.notify("Dictation finished but no input field is focused — transcript copied to clipboard", "warning");
   };
 
   const cleanup = () => {
+    generation++; // invalidate the dying session's event handlers
+    dbg(`cleanup → gen ${generation}`);
     flush();
     stopSpinner();
     stopMeter();
@@ -196,6 +311,8 @@ export default function (pi: ExtensionAPI) {
     flushed = false;
     cancelled = false;
     state = "recording";
+    const myGeneration = ++generation;
+    dbg(`start (gen ${myGeneration})`);
     startMeter();
 
     // Spawn sox `rec` to capture 16kHz / 16-bit / mono PCM to stdout.
@@ -224,16 +341,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     rec.on("error", (err) => {
+      if (myGeneration !== generation) return;
       ctx.ui.notify(`rec error: ${err.message} (install sox: brew install sox)`, "error");
       cleanup();
     });
 
     rec.on("exit", (code) => {
+      if (myGeneration !== generation) return; // stale recorder — a newer/ended session owns state
       // Natural exit on SIGTERM during stopDictation is fine. Anything else
       // mid-recording is a problem.
       if (state === "recording" && code !== null && code !== 0) {
         if (activeCtx) {
-          activeCtx.ui.notify(`rec exited unexpectedly (code ${code})`, "warn");
+          activeCtx.ui.notify(`rec exited unexpectedly (code ${code})`, "warning");
         }
         cleanup();
       }
@@ -250,6 +369,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     ws.addEventListener("open", () => {
+      if (myGeneration !== generation) {
+        dbg(`ws open (stale gen ${myGeneration}, current ${generation}) — ignored`);
+        return;
+      }
+      dbg(`ws open (gen ${myGeneration})`);
       if (!rec || !ws) return;
       rec.stdout.on("data", (chunk: Buffer) => {
         // Track loudness for the meter (just the latest chunk's RMS — the meter
@@ -262,6 +386,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     ws.addEventListener("message", (ev) => {
+      if (myGeneration !== generation) return;
       try {
         const msg = JSON.parse(ev.data as string);
         if (msg.type === "Results" && msg.is_final) {
@@ -276,11 +401,21 @@ export default function (pi: ExtensionAPI) {
     });
 
     ws.addEventListener("error", () => {
+      if (myGeneration !== generation) {
+        dbg(`ws error (stale gen ${myGeneration}, current ${generation}) — ignored`);
+        return;
+      }
+      dbg(`ws error (gen ${myGeneration})`);
       if (activeCtx) activeCtx.ui.notify("Deepgram WebSocket error", "error");
       cleanup();
     });
 
-    ws.addEventListener("close", () => {
+    ws.addEventListener("close", (ev) => {
+      if (myGeneration !== generation) {
+        dbg(`ws close (stale gen ${myGeneration}, current ${generation}, code ${ev.code}) — ignored`);
+        return;
+      }
+      dbg(`ws close (gen ${myGeneration}, code ${ev.code})`);
       // Server-initiated close (or our own close in cleanup): finalize.
       if (state === "recording" || state === "stopping") {
         cleanup();
@@ -328,15 +463,68 @@ export default function (pi: ExtensionAPI) {
     cleanup();
   };
 
+  /** Toggle dictation, gated on there being somewhere for the text to go. */
+  const toggleDictation = (ctx: ExtensionContext) => {
+    lastCtx = ctx;
+    if (state === "idle") {
+      if (tuiHandle && !resolveTarget()) {
+        ctx.ui.notify("No input field is focused — dictation not started", "warning");
+        return;
+      }
+      startDictation(ctx);
+    } else if (state === "recording") {
+      stopDictation();
+    }
+    // Ignore presses during the "stopping" state — Deepgram is finalizing.
+  };
+
+  // Global input listener: catches alt+m/alt+n before ANY focused component,
+  // which is what makes dictation work inside dialogs. Registered once the
+  // TUI handle is captured (see session_start below).
+  const onGlobalInput = (data: string) => {
+    // Kitty flag-2 terminals send press + REPEAT + RELEASE events, and input
+    // listeners run BEFORE the TUI's release filter (that filter only guards
+    // dispatch to the focused component). matchesKey also ignores the Kitty
+    // event type. Without this guard a single physical alt+m press toggles
+    // TWICE: press starts dictation, release instantly stops it and closes
+    // the WebSocket mid-handshake — which then surfaces as
+    // "Deepgram WebSocket error" (and its stale error event can kill the NEXT
+    // session). Filter to press events only.
+    if (isKeyRelease(data) || isKeyRepeat(data)) return undefined;
+    if (matchesKey(data, Key.alt("m"))) {
+      dbg(`alt+m (data=${JSON.stringify(data)}) state=${state}`);
+      if (lastCtx) toggleDictation(lastCtx);
+      return { consume: true };
+    }
+    if (matchesKey(data, Key.alt("n"))) {
+      dbg(`alt+n (data=${JSON.stringify(data)}) state=${state}`);
+      cancelDictation();
+      return { consume: true };
+    }
+    return undefined;
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    lastCtx = ctx;
+    if (ctx.mode !== "tui" || tuiHandle) return;
+    // Capture the TUI handle via an invisible zero-height widget. The
+    // listener function reference is stable, so even if the factory re-runs
+    // the TUI's listener Set de-dupes it.
+    ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
+      tuiHandle = tui;
+      removeInputListener = tui.addInputListener(onGlobalInput);
+      return { render: () => [], invalidate: () => {} };
+    });
+  });
+
+  // Shortcut registrations kept as a fallback for contexts where the TUI
+  // handle was never captured (non-TUI modes, older pi): they only fire when
+  // the main editor is focused, but that's precisely the legacy path. When
+  // the listener IS installed it consumes the key first, so no double-fire.
   pi.registerShortcut(Key.alt("m"), {
     description: "Toggle voice dictation (Deepgram)",
     handler: async (ctx) => {
-      if (state === "idle") {
-        startDictation(ctx);
-      } else if (state === "recording") {
-        stopDictation();
-      }
-      // Ignore presses during the "stopping" state — Deepgram is finalizing.
+      toggleDictation(ctx);
     },
   });
 
@@ -351,5 +539,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     if (state !== "idle") cleanup();
+    removeInputListener?.();
+    removeInputListener = null;
   });
 }
