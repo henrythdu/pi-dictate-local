@@ -1,8 +1,8 @@
 /**
  * dictate — minimal voice dictation for pi.
  *
- * Press ctrl+shift+m to start, press it again to stop.
- * Press ctrl+shift+n to cancel and discard the in-flight transcript.
+ * Press alt+m to start, press it again to stop.
+ * Press alt+n to cancel and discard the in-flight transcript.
  * On stop, the finalized transcript is appended to the pi input editor.
  *
  * Requires:
@@ -328,7 +328,7 @@ export default function (pi: ExtensionAPI) {
     cleanup();
   };
 
-  pi.registerShortcut(Key.ctrlShift("m"), {
+  pi.registerShortcut(Key.alt("m"), {
     description: "Toggle voice dictation (Deepgram)",
     handler: async (ctx) => {
       if (state === "idle") {
@@ -342,7 +342,7 @@ export default function (pi: ExtensionAPI) {
 
   // Dedicated cancel binding. Dictation-only — a no-op when no dictation is
   // in flight, so it's safe to hammer without affecting anything else.
-  pi.registerShortcut(Key.ctrlShift("n"), {
+  pi.registerShortcut(Key.alt("n"), {
     description: "Cancel voice dictation (discard transcript)",
     handler: async () => {
       cancelDictation();
