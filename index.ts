@@ -33,7 +33,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import { appendFileSync } from "node:fs";
 
 // Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
@@ -129,7 +130,7 @@ function rmsToBlock(rms: number): string {
 
 export default function (pi: ExtensionAPI) {
   let state: State = "idle";
-  let rec: ChildProcessWithoutNullStreams | null = null;
+  let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
   let ws: WebSocket | null = null;
   let finals: string[] = [];
   let activeCtx: ExtensionContext | null = null;
@@ -316,8 +317,9 @@ export default function (pi: ExtensionAPI) {
     startMeter();
 
     // Spawn sox `rec` to capture 16kHz / 16-bit / mono PCM to stdout.
+    let proc: ChildProcessByStdio<null, Readable, Readable>;
     try {
-      rec = spawn(
+      proc = spawn(
         "rec",
         [
           "-q", // quiet
@@ -339,14 +341,15 @@ export default function (pi: ExtensionAPI) {
       cleanup();
       return;
     }
+    rec = proc;
 
-    rec.on("error", (err) => {
+    proc.on("error", (err) => {
       if (myGeneration !== generation) return;
       ctx.ui.notify(`rec error: ${err.message} (install sox: brew install sox)`, "error");
       cleanup();
     });
 
-    rec.on("exit", (code) => {
+    proc.on("exit", (code) => {
       if (myGeneration !== generation) return; // stale recorder — a newer/ended session owns state
       // Natural exit on SIGTERM during stopDictation is fine. Anything else
       // mid-recording is a problem.

@@ -1,0 +1,16 @@
+{
+  "name": "pi-extension-dictate",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal voice dictation for pi (Deepgram Nova-3 streaming)",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.0"
+  }
+}
