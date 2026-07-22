@@ -13,6 +13,14 @@ Minimal voice dictation for pi. No floating bubbles, no menu bar app, no notific
 - **Backend:** Deepgram Nova-3 streaming
 - **What's "real-time":** audio is transcribed *while you talk*; the finalized text is inserted in one shot when you stop. Stop-to-display latency is typically ~300-500ms.
 
+## Install
+
+```bash
+pi install git:github.com/amosblomqvist/pi-dictate
+```
+
+Or manually: copy `index.ts` to `~/.pi/agent/extensions/dictate/index.ts`.
+
 ## One-time setup
 
 ```bash

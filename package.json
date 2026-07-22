@@ -4,6 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Minimal voice dictation for pi (Deepgram Nova-3 streaming)",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "scripts": {
     "check": "tsc --noEmit"
   },
