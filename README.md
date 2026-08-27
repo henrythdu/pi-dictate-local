@@ -1,107 +1,97 @@
 # dictate
 
-Minimal **local** voice dictation for pi. Runs entirely on your machine via **whisper.cpp** — no cloud, no paid API, and no audio is ever written to disk (unless you opt into the `DICTATE_DUMP_WAV` debug flag). No floating bubbles, no menu bar app, no notifications.
+Local voice dictation for pi. Runs on your machine with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). No cloud, no paid API. Audio is never written to disk (unless you set `DICTATE_DUMP_WAV=1`).
 
-- **Toggle:** `alt+k` (press to start, press again to stop) — works **anywhere in pi**, not just the main chat input: quiz popups, `ask_user_question`, `ctx.ui.editor()`/`input()` dialogs, selectors. The key is intercepted at the TUI input layer, before whatever component has focus.
-- **Cancel:** `alt+n` (discard the in-flight recording; safe to press anytime, no-op when nothing is recording)
-- **Where text goes:** to whatever input field is focused **when you stop** (never replaces, always appends):
-  - Main chat editor or any `ctx.ui.editor()`/`input()` popup → appended directly.
-  - Opaque dialogs (quiz / ask_user_question selects) → typed in as keystrokes. Their internal focus is invisible to the extension, so **Tab into the note/Other field first** — that's where the text will land.
-  - Nothing text-capable focused → transcript is copied to the clipboard (via `wl-copy` on Wayland, `pbcopy` on macOS — override with `DICTATE_CLIP_CMD`) and a notification says so. A finished dictation is never lost.
-- **Start guard:** if no input field is focused when you press `alt+k`, dictation doesn't start and a notification explains why.
-- **Live feedback:** while recording, the status row shows a red `●` plus a real-time mic-level meter (`● ▂▅▇ listening…`) — instant confirmation your mic is live. On stop it flips to a `transcribing…` spinner while whisper transcribes.
-
-## Why local
-
-- **No paid API.** Your voice never leaves the machine; there are no recurring costs and no API key.
-- **No audio artifacts.** The take lives only in RAM for the ~second it takes to transcribe, then is discarded. Only a tiny transcript text file is written transiently (and deleted); no audio ever touches disk (unless you set `DICTATE_DUMP_WAV=1`).
+- **Toggle:** `alt+k` — press to start, press again to stop. Works in any pi input: the chat editor, quiz popups, `ask_user_question` dialogs, selectors. The key is caught at the TUI input layer, before whatever component has focus.
+- **Cancel:** `alt+n` — discards the recording. No-op when nothing is recording.
+- **Where text goes:** to the input field that is focused when you stop. It appends, never replaces.
+  - Chat editor or any `ctx.ui.editor()`/`input()` popup → appended.
+  - Opaque dialogs (quiz / `ask_user_question` selects) → typed as keystrokes. Their internal focus is hidden from the extension, so **Tab into the note/Other field first**.
+  - Nothing text-accepting focused → transcript is copied to the clipboard (`wl-copy` on Wayland, `pbcopy` on macOS, override with `DICTATE_CLIP_CMD`).
+- **Start rule:** if no input field is focused when you press `alt+k`, dictation does not start.
+- **While recording:** the status row shows a red `●` and a mic-level meter (`● ▂▅▇ listening…`). Flat bars = no audio reaching the mic. On stop it shows a `transcribing…` spinner.
 
 ## Install
 
 ```bash
-# extension:
-pi install git:github.com/henrythdu/pi-dictate-local   # this fork
-#  - or copy index.ts to ~/.pi/agent/extensions/dictate/index.ts (standalone)
+pi install git:github.com/henrythdu/pi-dictate-local
 ```
 
-## One-time setup — you need whisper.cpp
+Or copy `index.ts` to `~/.pi/agent/extensions/dictate/index.ts` (standalone).
 
-The extension shells out to the `whisper-cli` binary with a `whisper.cpp` ggml model. Install both:
+## Setup
+
+The extension runs the `whisper-cli` binary with a whisper.cpp ggml model. Install both:
 
 ```bash
 # 1. mic capture (ALSA) — usually already present on Linux
 sudo apt install alsa-utils          # provides `arecord`
 
-# 2. whisper.cpp — a CUDA build is best if you have an NVIDIA GPU:
+# 2. whisper.cpp — CUDA build if you have an NVIDIA GPU:
 git clone https://github.com/ggml-org/whisper.cpp
 cd whisper.cpp
-cmake -B build -DGGML_CUDA=ON         # CMake 3.14+; uses your CUDA toolkit
+cmake -B build -DGGML_CUDA=ON         # CMake 3.14+
 cmake --build build --config Release -j
 sudo cp build/bin/whisper-cli /usr/local/bin/
 
-# 3. the model (English-only pick; swap size freely)
+# 3. the model
 #    download ggml-small.en.bin → ~/.cache/whisper/
 ```
 
-A CPU build of whisper.cpp works identically if you have no NVIDIA GPU — just slower.
+A CPU build of whisper.cpp works too — just slower.
 
 ## Usage
 
-1. Focus any pi input field — the main chat input, a quiz note field, an `ask_user_question` answer box.
-2. Press `alt+k`. The status row shows a red `●` with a live mic-level meter: `● ▁▂▃▅ listening…`. The bars move with your voice — if they stay flat, no audio is reaching the mic.
+1. Focus a pi input field.
+2. Press `alt+k`. The status row shows a red `●` and a mic-level meter. The bars move with your voice; if they stay flat, no audio is reaching the mic.
 3. Talk.
-4. Press `alt+k` again. The meter is replaced by a braille spinner (`⠋ transcribing…`), then the text appears in the focused input.
+4. Press `alt+k` again. A `transcribing…` spinner appears, then the text lands in the focused input.
 
-Focus is resolved fresh at stop time, so if a dialog opened (or focus moved) while you were talking, the text goes to whatever is focused at that moment.
-
-Run `/reload` in pi after first install (or after editing `index.ts`) to pick up changes.
+Run `/reload` in pi after install (or after editing `index.ts`).
 
 ## How it works
 
-- While recording, the extension spawns `arecord` capturing 16kHz mono 16-bit PCM and buffers it **entirely in RAM** (a short dictation is ~1MB — trivial). Each chunk's RMS drives the live level meter.
-- On stop, it kills the recorder and builds a standard WAV header in memory, then spawns `whisper-cli -m <model> -f - -nt -of - -otxt` (adding `-ng` when GPU is disabled) and pipes the WAV in via **stdin** — no audio file is written.
-- The transcript is written to stdout; the extension routes it to a temp file descriptor and reads it back after the process exits (whisper-cli won't emit text to a Node-created pipe), then delivers it through pi's focus-aware path:
-  - editor-like components (`.getText`/`.setText`, including popups' inner `.editor`) get a direct append;
-  - opaque components get the text as synthetic keystrokes routed by their own focus logic;
-  - nothing focused → clipboard + a notification.
-- whisper-cli runs as a short-lived process per dictation: the model is loaded, the take is transcribed, and the process exits — releasing any GPU memory it used.
+- While recording, the extension runs `arecord` capturing 16kHz mono 16-bit PCM and buffers it in memory (a short take is ~1MB).
+- On stop it builds a WAV header in memory, runs `whisper-cli -m <model> -f - -nt -of - -otxt` (adds `-ng` when GPU is off) and pipes the WAV in via stdin — no audio file is written.
+- whisper-cli writes the transcript to stdout; the extension reads it back after the process exits, then appends it to the focused input (or copies to clipboard).
+- Each take runs whisper-cli as a short-lived process: model loads, take is transcribed, process exits and frees GPU memory.
 
-## Customizing
+## Configuration
 
-All knobs are at the top of `index.ts`, and most are env-overridable:
+Knobs are at the top of `index.ts`; most are env-overridable:
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `WHISPER_CLI` | `whisper-cli` | path to the whisper.cpp binary |
 | `WHISPER_MODEL` | `~/.cache/whisper/ggml-small.en.bin` | ggml model file |
-| `WHISPER_GPU_LAYERS` | `24` | `0` = run fully on CPU (`-ng`); any `>0` = use GPU (default). whisper.cpp ≥1.9 made this a binary GPU/CPU switch |
-| `DICTATE_STT_TIMEOUT_MS` | `15000` | safety timeout for a hung transcription |
-| `ARECORD_DEVICE` | (default `-D`) | ALSA capture device if the default isn't your mic |
-| `DICTATE_CLIP_CMD` | `wl-copy` | clipboard fallback command |
-| `DICTATE_DEBUG` | off | append lifecycle log to `/tmp/dictate-debug.log` |
-| `DICTATE_DUMP_WAV` | off | debug: dump the exact transcribed WAV to `/tmp/dictate-dump.wav` |
+| `WHISPER_GPU_LAYERS` | `24` | `0` = CPU (`-ng`); `>0` = GPU (default). Binary switch — whisper.cpp ≥1.9 has no layer-granular offload |
+| `DICTATE_STT_TIMEOUT_MS` | `15000` | time to wait for a hung transcription |
+| `ARECORD_DEVICE` | (system default) | ALSA capture device if the default isn't your mic |
+| `DICTATE_CLIP_CMD` | `wl-copy` | clipboard command |
+| `DICTATE_DEBUG` | off | write lifecycle log to `/tmp/dictate-debug.log` |
+| `DICTATE_DUMP_WAV` | off | debug: dump the transcribed WAV to `/tmp/dictate-dump.wav` |
 
-- **Hotkey:** change the `Key.alt("k")` / `Key.alt("n")` references near the bottom (the input listener `onGlobalInput` and the fallback `pi.registerShortcut` calls).
-- **Model:** edit `WHISPER_MODEL` (or set the env var) — swap `ggml-small.en` for `base.en`, `medium.en`, etc. Only affects download size and accuracy; GPU latency is negligible either way.
-- **GPU:** to disable GPU entirely (e.g. to free all VRAM for other workloads), set `WHISPER_GPU_LAYERS=0`.
+- **Hotkey:** change the `Key.alt("k")` / `Key.alt("n")` references near the bottom of `index.ts`.
+- **Model:** set `WHISPER_MODEL` — swap `ggml-small.en` for `base.en`, `medium.en`, etc. Only affects download size and accuracy.
+- **GPU:** set `WHISPER_GPU_LAYERS=0` to disable GPU (frees VRAM for other work).
 
-## Why `alt+k` / `alt+n` (and tmux)
+## Why `alt+k` / `alt+n` (tmux)
 
-These are `alt`-based because **`ctrl+shift+<letter>` is not representable as a legacy terminal byte** — adding Shift to `Ctrl+M` doesn't change the byte, so `Ctrl+Shift+M` is indistinguishable from `Ctrl+M` (i.e. `\r` = Enter). That means inside **tmux** (which doesn't pass through the Kitty keyboard protocol, and only forwards modified keys when `extended-keys` is on — it's off by default), `ctrl+shift+k` would collapse to `Ctrl+K`. `alt+<letter>` has a distinct legacy byte (`Alt+K` → `ESC k`), which tmux forwards even without `extended-keys`, so the binding works both inside and outside tmux.
+These are `alt`-based because `ctrl+shift+<letter>` is not representable as a legacy terminal byte. Adding Shift to `Ctrl+M` doesn't change the byte, so `Ctrl+Shift+M` is the same as `Ctrl+M` (`\r` = Enter). Inside tmux (which doesn't pass through the Kitty keyboard protocol and only forwards modified keys when `extended-keys` is on — off by default), `ctrl+shift+k` collapses to `Ctrl+K`. `alt+<letter>` has a distinct legacy byte (`Alt+K` → `ESC k`), which tmux forwards even without `extended-keys`, so the binding works inside and outside tmux.
 
-On macOS, your terminal must treat Option as Alt/Meta (pi already requires this for its own `alt+enter` follow-up and `alt+up` dequeue bindings). Ghostty does this by default; in iTerm2 set Profile → Keys → Left/Right Option key → `Esc+`.
+On macOS, your terminal must treat Option as Alt/Meta. Ghostty does this by default; in iTerm2 set Profile → Keys → Left/Right Option key → `Esc+`.
 
-If you prefer different bindings, edit the `registerShortcut` calls at the bottom of `index.ts`.
+To use different bindings, edit the `registerShortcut` calls at the bottom of `index.ts`.
 
 ## Troubleshooting
 
-- **"whisper-cli not found"** — install whisper.cpp and ensure `whisper-cli` is on `PATH` (or set `WHISPER_CLI`). Verify with `whisper-cli --version`.
+- **"whisper-cli not found"** — install whisper.cpp and put `whisper-cli` on `PATH` (or set `WHISPER_CLI`). Verify with `whisper-cli --version`.
 - **"Whisper model not found"** — put the `ggml-*.bin` file at `WHISPER_MODEL`'s default (`~/.cache/whisper/`) or set `WHISPER_MODEL`.
-- **"arecord error / Failed to spawn 'arecord'"** — `sudo apt install alsa-utils`; verify with `which arecord`. If the default device isn't your mic, set `ARECORD_DEVICE` (find names with `arecord -l`).
-- **No mic input** — first check the level meter: if the bars stay flat while you talk, no audio is reaching arecord. Linux may need mic access granted to your terminal/desktop environment.
-- **Slow transcription** — set `WHISPER_GPU_LAYERS=0` for pure CPU, or use a GPU build/model; a CPU `whisper-cli` build works fine, just slower on long takes.
-- **'whisper failed (code …)' / "No speech detected"** — run `whisper-cli -m <model> -f - -nt -of - -otxt` manually to see stderr. "No speech detected" means the mic captured silence — check `ARECORD_DEVICE`. If you instead see a "Whisper backend error" message, that's a real whisper/GPU failure (not the mic) — check the stderr text in the message.
-- **Nothing happens after stop** — check `DICTATE_DEBUG=1` and the `/tmp/dictate-debug.log`. If you saw "no input field is focused", the transcript was copied to the clipboard — paste with Ctrl+V (or ⌘V on mac).
-- **Dictated text vanished into a quiz/ask dialog** — the dialog's option list (not its text field) had focus. Tab into the note/Other field before toggling dictation.
-- **`alt+k` inserts `µ` instead of toggling** (macOS) — your terminal isn't treating Option as Alt. In iTerm2: Profile → Keys → Left/Right Option key → `Esc+`. (Ghostty/Kitty/WezTerm do this by default.)
-- **Need lifecycle logs?** Run pi with `DICTATE_DEBUG=1` — the extension appends timestamped events (key hits, toggles, spawn/exit/errors with their session generation) to `/tmp/dictate-debug.log`.
+- **"arecord error"** — install alsa-utils (`which arecord`). If the default device isn't your mic, set `ARECORD_DEVICE` (list devices with `arecord -l`).
+- **Flat meter while talking** — no audio is reaching `arecord`. Grant mic access to your terminal/desktop environment, or set `ARECORD_DEVICE`.
+- **Slow transcription** — set `WHISPER_GPU_LAYERS=0` for CPU, or use a GPU build.
+- **"whisper failed (code …)"** — run `whisper-cli -m <model> -f - -nt -of - -otxt` manually to see stderr.
+- **"No speech detected"** — the mic captured silence; check `ARECORD_DEVICE`. A separate **"Whisper backend error"** message means a real whisper/GPU failure, not the mic.
+- **Nothing after stop** — run with `DICTATE_DEBUG=1` and check `/tmp/dictate-debug.log`. If you saw "no input field is focused", the text went to the clipboard — paste with Ctrl+V.
+- **Text vanished into a quiz/ask dialog** — the dialog's option list had focus. Tab into the note/Other field first.
+- **`alt+k` inserts `µ`** (macOS) — your terminal isn't treating Option as Alt. In iTerm2: Profile → Keys → Left/Right Option key → `Esc+`.
