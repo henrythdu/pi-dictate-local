@@ -75,14 +75,6 @@ Knobs are at the top of `index.ts`; most are env-overridable:
 - **Model:** set `WHISPER_MODEL` — swap `ggml-small.en` for `base.en`, `medium.en`, etc. Only affects download size and accuracy.
 - **GPU:** set `WHISPER_GPU_LAYERS=0` to disable GPU (frees VRAM for other work).
 
-## Why `alt+k` / `alt+n` (tmux)
-
-These are `alt`-based because `ctrl+shift+<letter>` is not representable as a legacy terminal byte. Adding Shift to `Ctrl+M` doesn't change the byte, so `Ctrl+Shift+M` is the same as `Ctrl+M` (`\r` = Enter). Inside tmux (which doesn't pass through the Kitty keyboard protocol and only forwards modified keys when `extended-keys` is on — off by default), `ctrl+shift+k` collapses to `Ctrl+K`. `alt+<letter>` has a distinct legacy byte (`Alt+K` → `ESC k`), which tmux forwards even without `extended-keys`, so the binding works inside and outside tmux.
-
-On macOS, your terminal must treat Option as Alt/Meta. Ghostty does this by default; in iTerm2 set Profile → Keys → Left/Right Option key → `Esc+`.
-
-To use different bindings, edit the `registerShortcut` calls at the bottom of `index.ts`.
-
 ## Troubleshooting
 
 - **"whisper-cli not found"** — install whisper.cpp and put `whisper-cli` on `PATH` (or set `WHISPER_CLI`). Verify with `whisper-cli --version`.
