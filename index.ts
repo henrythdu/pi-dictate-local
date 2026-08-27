@@ -381,7 +381,7 @@ export default function (pi: ExtensionAPI) {
     if (state !== "recording") return;
     state = "stopping";
     stopMeter();
-    startSpinner("transcribing…");
+    startSpinner(`transcribing${GPU_ON ? " (GPU)" : " (CPU)"}…`);
 
     // Stop the mic first so no more audio accumulates.
     if (rec) {
@@ -463,7 +463,7 @@ export default function (pi: ExtensionAPI) {
         // Empty output. Single retry on CPU when GPU was used.
         if (GPU_ON && !forceCpu) {
           dbg("empty GPU transcript → retrying on CPU");
-          startSpinner("retrying on CPU…");
+          startSpinner("empty GPU output — retrying on CPU…");
           spawnStt(true);
           return;
         }
@@ -498,7 +498,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (GPU_ON && !forceCpu) {
           dbg("GPU transcription timed out → retrying on CPU");
-          startSpinner("retrying on CPU…");
+          startSpinner("GPU timed out — retrying on CPU…");
           spawnStt(true);
           return;
         }
