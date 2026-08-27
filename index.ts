@@ -66,10 +66,14 @@ const HOME = process.env.HOME ?? "";
 const WHISPER_CLI = process.env.WHISPER_CLI ?? "whisper-cli";
 const WHISPER_MODEL =
   process.env.WHISPER_MODEL ?? `${HOME}/.cache/whisper/ggml-small.en.bin`;
-// Number of layers offloaded to the GPU (-ngl). whisper.cpp offloads its whole
-// (small) model by default, but we cap it so a dictation can never OOM while
-// LM Studio already holds most of VRAM. 0 = fully CPU.
+// GPU control. whisper.cpp ≥1.9 has no layer-granular offload (-ngl was removed);
+// it's binary: GPU on by default, or fully CPU with -ng.
+// Set WHISPER_GPU_LAYERS=0 to run entirely on CPU (frees ALL VRAM for LM Studio).
+// Even on GPU, small.en's occupancy is ~600MB and transient — the process exits
+// after each dictation, so it never resides alongside LM Studio models.
+// (Env value kept as a tiny bit-flag for source compatibility with older docs.)
 const WHISPER_GPU_LAYERS = Number(process.env.WHISPER_GPU_LAYERS ?? 24);
+const GPU_ON = WHISPER_GPU_LAYERS > 0;
 const STT_TIMEOUT_MS = Number(process.env.DICTATE_STT_TIMEOUT_MS ?? 15000);
 const ARECORD_DEVICE = process.env.ARECORD_DEVICE ?? "";
 const CLIP_CMD = process.env.DICTATE_CLIP_CMD ?? "wl-copy";
@@ -394,12 +398,10 @@ export default function (pi: ExtensionAPI) {
 
     // Pipe the in-memory WAV into whisper-cli stdin; nothing is written to disk.
     let proc: ChildProcessWithoutNullStreams;
+    const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt"];
+    if (!GPU_ON) args.push("-ng"); // run fully on CPU instead of GPU
     try {
-      proc = spawn(
-        WHISPER_CLI,
-        ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-ngl", String(WHISPER_GPU_LAYERS)],
-        { stdio: ["pipe", "pipe", "pipe"] },
-      );
+      proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", "pipe", "pipe"] });
     } catch (e: any) {
       if (activeCtx) activeCtx.ui.notify(`whisper-cli failed to spawn: ${e.message}`, "error");
       cleanup();
