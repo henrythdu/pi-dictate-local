@@ -1,6 +1,6 @@
 # dictate
 
-Local voice dictation for pi. Runs on your machine with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). No cloud, no paid API. Audio is never written to disk (unless you set `DICTATE_DUMP_WAV=1`).
+Local voice dictation for pi. Runs on your machine with [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 
 - **Toggle:** `alt+k` — press to start, press again to stop. Works in any pi input: the chat editor, quiz popups, `ask_user_question` dialogs, selectors. The key is caught at the TUI input layer, before whatever component has focus.
 - **Cancel:** `alt+n` — discards the recording. No-op when nothing is recording.
