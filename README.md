@@ -4,11 +4,7 @@ Local voice dictation for pi. Runs on your machine with [whisper.cpp](https://gi
 
 - **Toggle:** `alt+k` — press to start, press again to stop. Works in any pi input: the chat editor, quiz popups, `ask_user_question` dialogs, selectors. The key is caught at the TUI input layer, before whatever component has focus.
 - **Cancel:** `alt+n` — discards the recording. No-op when nothing is recording.
-- **Where text goes:** to the input field that is focused when you stop. It appends, never replaces.
-  - Chat editor or any `ctx.ui.editor()`/`input()` popup → appended.
-  - Opaque dialogs (quiz / `ask_user_question` selects) → typed as keystrokes. Their internal focus is hidden from the extension, so **Tab into the note/Other field first**.
-  - Nothing text-accepting focused → transcript is copied to the clipboard (`wl-copy` on Wayland, `pbcopy` on macOS, override with `DICTATE_CLIP_CMD`).
-- **Start rule:** if no input field is focused when you press `alt+k`, dictation does not start.
+- **Where text goes:** to the focused input field (appends). If none, to the clipboard (`DICTATE_CLIP_CMD`, default `wl-copy`).
 - **While recording:** the status row shows a red `●` and a mic-level meter (`● ▂▅▇ listening…`). Flat bars = no audio reaching the mic. On stop it shows a `transcribing…` spinner.
 
 ## Install
