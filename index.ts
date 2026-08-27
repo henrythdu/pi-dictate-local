@@ -45,9 +45,10 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
-import { spawn, spawnSync, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, openSync, closeSync, readFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 // Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
 // lifecycle events (listener hits, toggles, spawn/exit, errors) to
@@ -165,9 +166,10 @@ function wavFromPcm16(pcm: Buffer): Buffer {
 }
 
 export default function (pi: ExtensionAPI) {
+  let sttSeq = 0; // unique temp transcript file per STT run (retries included)
   let state: State = "idle";
   let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
-  let transcribeProc: ChildProcessWithoutNullStreams | null = null;
+  let transcribeProc: ChildProcess | null = null;
   let pcmChunks: Buffer[] = [];
   let activeCtx: ExtensionContext | null = null;
   let cancelled = false;
@@ -419,27 +421,51 @@ export default function (pi: ExtensionAPI) {
     const spawnStt = (forceCpu: boolean) => {
       const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-of", "-", "-otxt"];
       if (forceCpu || !GPU_ON) args.push("-ng"); // run fully on CPU instead of GPU
-      let proc: ChildProcessWithoutNullStreams;
+      // whisper.cpp writes NO transcript to a Node-created stdout pipe (proven
+      // deterministic: 0 bytes; a real file fd gets the text). So route stdout
+      // to a temp file fd and read it back after exit. Audio still flows via
+      // the stdin pipe (works), so nothing but the tiny transcript text ever
+      // touches disk — no audio files.
+      const outPath = `${tmpdir()}/dictate-transcript-${process.pid}-${sttSeq++}.txt`;
+      let outFd: number;
       try {
-        proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", "pipe", "pipe"] });
+        outFd = openSync(outPath, "w");
       } catch (e: any) {
+        if (activeCtx) activeCtx.ui.notify(`failed to open transcript file: ${e.message}`, "error");
+        cleanup();
+        return;
+      }
+      let proc: ChildProcess;
+      try {
+        proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", outFd, "pipe"] });
+      } catch (e: any) {
+        try { closeSync(outFd); } catch {}
+        try { unlinkSync(outPath); } catch {}
         if (activeCtx) activeCtx.ui.notify(`whisper-cli failed to spawn: ${e.message}`, "error");
         cleanup();
         return;
       }
       transcribeProc = proc;
 
+      const finishOut = () => {
+        try { closeSync(outFd); } catch {}
+        let text = "";
+        try { text = readFileSync(outPath, "utf8").trim(); } catch {}
+        try { unlinkSync(outPath); } catch {}
+        return text;
+      };
+
       // One-shot per run: the timeout also fires `exit` when it kills the
       // process — without this guard we'd double-retry/double-deliver.
       let settled = false;
 
-      const out: Buffer[] = [];
-      proc.stdout.on("data", (c: Buffer) => out.push(c));
-      proc.stderr.on("data", () => {}); // swallow progress/noise
+      // stderr is still a pipe (progress/noise) but we swallow it.
+      proc.stderr!.on("data", () => {});
 
       proc.on("error", (e) => {
         if (settled) return;
         settled = true;
+        finishOut();
         if (myGeneration !== generation) return;
         if (activeCtx) activeCtx.ui.notify(`whisper-cli error: ${e.message}`, "error");
         cleanup();
@@ -453,7 +479,8 @@ export default function (pi: ExtensionAPI) {
           clearTimeout(stopTimeout);
           stopTimeout = null;
         }
-        const text = Buffer.concat(out).toString().trim();
+        // Read AFTER exit — stdout is block-buffered; a mid-run read is stale/empty.
+        const text = finishOut();
         dbg(`stt exit code=${code} cpu=${forceCpu} text=${text.slice(0, 80)}`);
         if (text) {
           deliverTranscript(text);
@@ -476,7 +503,7 @@ export default function (pi: ExtensionAPI) {
         cleanup();
       });
 
-      proc.stdin.end(wav);
+      proc.stdin!.end(wav);
 
       // Safety net: if whisper never exits, kill it and retry/notify.
       if (stopTimeout) clearTimeout(stopTimeout);
@@ -490,7 +517,7 @@ export default function (pi: ExtensionAPI) {
             transcribeProc.kill("SIGTERM");
           } catch {}
         }
-        const text = Buffer.concat(out).toString().trim();
+        const text = finishOut();
         if (text) {
           deliverTranscript(text);
           cleanup();
