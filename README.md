@@ -20,7 +20,7 @@ Minimal **local** voice dictation for pi. Runs entirely on your machine via **wh
 
 ```bash
 # extension:
-pi install git:github.com/<you>/pi-dictate-local   # managed package (git fork)
+pi install git:github.com/henrythdu/pi-dictate-local   # this fork
 #  - or copy index.ts to ~/.pi/agent/extensions/dictate/index.ts (standalone)
 ```
 
