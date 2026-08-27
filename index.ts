@@ -407,56 +407,107 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Pipe the in-memory WAV into whisper-cli stdin; nothing is written to disk.
-    let proc: ChildProcessWithoutNullStreams;
-    const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-of", "-", "-otxt"];
-    if (!GPU_ON) args.push("-ng"); // run fully on CPU instead of GPU
-    try {
-      proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", "pipe", "pipe"] });
-    } catch (e: any) {
-      if (activeCtx) activeCtx.ui.notify(`whisper-cli failed to spawn: ${e.message}`, "error");
-      cleanup();
-      return;
+    // whisper.cpp's CUDA backend can intermittently return an EMPTY transcript
+    // on audio the encoder's F16 path is weak on (known flaky encoder bug class,
+    // worsens under GPU contention). If the GPU run comes back empty, retry
+    // once on CPU (-ng) before concluding there was no speech.
+    if (stopTimeout) {
+      clearTimeout(stopTimeout);
+      stopTimeout = null;
     }
-    transcribeProc = proc;
 
-    const out: Buffer[] = [];
-    proc.stdout.on("data", (c: Buffer) => out.push(c));
-    proc.stderr.on("data", () => {}); // swallow progress/noise
-
-    proc.on("error", (e) => {
-      if (myGeneration !== generation) return;
-      if (activeCtx) activeCtx.ui.notify(`whisper-cli error: ${e.message}`, "error");
-      cleanup();
-    });
-
-    proc.on("exit", (code) => {
-      if (myGeneration !== generation) return; // stale transcription
-      const text = Buffer.concat(out).toString().trim();
-      if (text) {
-        deliverTranscript(text);
-      } else if (activeCtx) {
-        // Empty transcript: transcribe on silence used to fail silently —
-        // surface it instead so mic problems are diagnosable.
-        activeCtx.ui.notify(
-          code === 0 ? "No speech detected — check the mic (ARECORD_DEVICE)" : `whisper failed (code ${code})`,
-          "warning",
-        );
+    const spawnStt = (forceCpu: boolean) => {
+      const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-of", "-", "-otxt"];
+      if (forceCpu || !GPU_ON) args.push("-ng"); // run fully on CPU instead of GPU
+      let proc: ChildProcessWithoutNullStreams;
+      try {
+        proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", "pipe", "pipe"] });
+      } catch (e: any) {
+        if (activeCtx) activeCtx.ui.notify(`whisper-cli failed to spawn: ${e.message}`, "error");
+        cleanup();
+        return;
       }
-      cleanup();
-    });
+      transcribeProc = proc;
 
-    proc.stdin.end(wav);
+      // One-shot per run: the timeout also fires `exit` when it kills the
+      // process — without this guard we'd double-retry/double-deliver.
+      let settled = false;
 
-    // Safety net: if whisper never exits, force cleanup (delivering whatever
-    // came through) and surface a warning.
-    stopTimeout = setTimeout(() => {
-      if (state !== "stopping") return;
-      if (myGeneration !== generation) return;
-      const text = Buffer.concat(out).toString().trim();
-      if (text) deliverTranscript(text);
-      else if (activeCtx) activeCtx.ui.notify("Transcription timed out", "warning");
-      cleanup();
-    }, STT_TIMEOUT_MS);
+      const out: Buffer[] = [];
+      proc.stdout.on("data", (c: Buffer) => out.push(c));
+      proc.stderr.on("data", () => {}); // swallow progress/noise
+
+      proc.on("error", (e) => {
+        if (settled) return;
+        settled = true;
+        if (myGeneration !== generation) return;
+        if (activeCtx) activeCtx.ui.notify(`whisper-cli error: ${e.message}`, "error");
+        cleanup();
+      });
+
+      proc.on("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        if (myGeneration !== generation) return; // stale transcription
+        if (stopTimeout) {
+          clearTimeout(stopTimeout);
+          stopTimeout = null;
+        }
+        const text = Buffer.concat(out).toString().trim();
+        dbg(`stt exit code=${code} cpu=${forceCpu} text=${text.slice(0, 80)}`);
+        if (text) {
+          deliverTranscript(text);
+          cleanup();
+          return;
+        }
+        // Empty output. Single retry on CPU when GPU was used.
+        if (GPU_ON && !forceCpu) {
+          dbg("empty GPU transcript → retrying on CPU");
+          startSpinner("retrying on CPU…");
+          spawnStt(true);
+          return;
+        }
+        if (activeCtx) {
+          activeCtx.ui.notify(
+            code === 0 ? "No speech detected — check the mic (ARECORD_DEVICE)" : `whisper failed (code ${code})`,
+            "warning",
+          );
+        }
+        cleanup();
+      });
+
+      proc.stdin.end(wav);
+
+      // Safety net: if whisper never exits, kill it and retry/notify.
+      if (stopTimeout) clearTimeout(stopTimeout);
+      stopTimeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (state !== "stopping") return;
+        if (myGeneration !== generation) return;
+        if (transcribeProc) {
+          try {
+            transcribeProc.kill("SIGTERM");
+          } catch {}
+        }
+        const text = Buffer.concat(out).toString().trim();
+        if (text) {
+          deliverTranscript(text);
+          cleanup();
+          return;
+        }
+        if (GPU_ON && !forceCpu) {
+          dbg("GPU transcription timed out → retrying on CPU");
+          startSpinner("retrying on CPU…");
+          spawnStt(true);
+          return;
+        }
+        if (activeCtx) activeCtx.ui.notify("Transcription timed out", "warning");
+        cleanup();
+      }, STT_TIMEOUT_MS);
+    };
+
+    spawnStt(false);
   };
 
   /** Cancel dictation: discard any collected audio and tear everything down immediately. */
