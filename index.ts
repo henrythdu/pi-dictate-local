@@ -1,10 +1,10 @@
 /**
- * dictate — minimal voice dictation for pi.
+ * dictate — minimal voice dictation for pi. Local transcription.
  *
- * Press alt+m to start, press it again to stop.
+ * Press alt+k to start, press it again to stop.
  * Press alt+n to cancel and discard the in-flight transcript.
  *
- * Focus-aware: alt+m/alt+n are intercepted at the TUI input layer (before any
+ * Focus-aware: alt+k/alt+n are intercepted at the TUI input layer (before any
  * focused component), so dictation works inside ANY dialog — quiz popups,
  * ask_user_question, ctx.ui.editor()/input() — not just the main chat editor.
  *
@@ -20,26 +20,38 @@
  * nothing text-capable is focused at stop, the transcript is copied to the
  * clipboard and a notification says so — a finished dictation is never lost.
  *
- * Requires:
- *   - sox installed (`brew install sox` — provides the `rec` command)
- *   - DEEPGRAM_API_KEY environment variable set
+ * Local pipeline (no cloud, no audio persisted):
+ *   arecord captures 16kHz/16-bit/mono PCM into memory.
+ *   On stop a WAV header is built in memory and piped straight into
+ *   whisper-cli stdin (whisper.cpp, ggml.cuda build). Nothing is written to
+ *   disk — the audio exists only in RAM for the duration of the take, then is
+ *   discarded. Default hotkeys are alt+k (toggle) / alt+n (cancel) so they
+ *   don't clash with pi-intercom's alt+m.
  *
- * Streaming model: audio is sent to Deepgram while you talk; the server
- * transcribes in real time and emits per-utterance "final" results. We
- * collect those finals and inject the concatenated text on stop. No
- * partials are shown in the editor (cosmetic-only), so quality is good
- * and the editor never shows revisable text.
+ * Requires:
+ *   - arecord             (ALSA utils; usually preinstalled on Linux)
+ *   - whisper-cli         (whisper.cpp — preferably a CUDA build for GPU)
+ *   - a ggml model file, e.g. ggml-small.en.bin
+ *
+ * Tuning (all env-overridable):
+ *   WHISPER_CLI            path to whisper-cli (default: "whisper-cli" on PATH)
+ *   WHISPER_MODEL          path to the ggml model (default: ~/.cache/whisper/ggml-small.en.bin)
+ *   WHISPER_GPU_LAYERS     -ngl layers offloaded to GPU (default 24; set 0 = full CPU,
+ *                           lower if it must share VRAM with LM Studio)
+ *   DICTATE_STT_TIMEOUT_MS safety timeout for a hung transcription (default 15000)
+ *   ARECORD_DEVICE         ALSA device for arecord -D (default: system default)
+ *   DICTATE_CLIP_CMD       clipboard fallback command (default: wl-copy, Linux; pbcopy on mac)
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 
 // Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
-// lifecycle events (listener hits, toggles, ws open/error/close with their
-// generation) to /tmp/dictate-debug.log.
+// lifecycle events (listener hits, toggles, spawn/exit, errors) to
+// /tmp/dictate-debug.log.
 const DEBUG = !!process.env.DICTATE_DEBUG;
 const dbg = (msg: string) => {
   if (!DEBUG) return;
@@ -48,24 +60,21 @@ const dbg = (msg: string) => {
   } catch {}
 };
 
-// Deepgram streaming endpoint. Tuning notes:
-//   model=nova-3        — flagship, sub-300ms latency, best accuracy
-//   encoding=linear16   — raw 16-bit PCM (what sox/rec gives us with -e signed-integer -b 16)
-//   sample_rate=16000   — 16kHz mono is the standard low-bandwidth STT format
-//   interim_results=false — we only want finals, never partials
-//   smart_format=true   — formats numbers, dates, currencies nicely
-//   punctuate=true      — adds commas/periods/question marks
-//   endpointing=300     — 300ms of silence ends an utterance (faster finals)
-const DG_URL =
-  "wss://api.deepgram.com/v1/listen" +
-  "?model=nova-3" +
-  "&encoding=linear16" +
-  "&sample_rate=16000" +
-  "&channels=1" +
-  "&interim_results=false" +
-  "&smart_format=true" +
-  "&punctuate=true" +
-  "&endpointing=300";
+const HOME = process.env.HOME ?? "";
+
+// ── Local STT knobs (env-overridable) ─────────────────────────────────────
+const WHISPER_CLI = process.env.WHISPER_CLI ?? "whisper-cli";
+const WHISPER_MODEL =
+  process.env.WHISPER_MODEL ?? `${HOME}/.cache/whisper/ggml-small.en.bin`;
+// Number of layers offloaded to the GPU (-ngl). whisper.cpp offloads its whole
+// (small) model by default, but we cap it so a dictation can never OOM while
+// LM Studio already holds most of VRAM. 0 = fully CPU.
+const WHISPER_GPU_LAYERS = Number(process.env.WHISPER_GPU_LAYERS ?? 24);
+const STT_TIMEOUT_MS = Number(process.env.DICTATE_STT_TIMEOUT_MS ?? 15000);
+const ARECORD_DEVICE = process.env.ARECORD_DEVICE ?? "";
+const CLIP_CMD = process.env.DICTATE_CLIP_CMD ?? "wl-copy";
+
+const AUDIO_SAMPLE_RATE = 16000;
 
 type State = "idle" | "recording" | "stopping";
 
@@ -73,7 +82,7 @@ type State = "idle" | "recording" | "stopping";
 // The TUI handle is captured once via a zero-height widget factory (the only
 // extension-API surface that exposes it). With it we can:
 //   1. Listen to ALL terminal input via tui.addInputListener — listeners run
-//      before the focused component, so alt+m works even while a custom
+//      before the focused component, so alt+k works even while a custom
 //      dialog has stolen focus from the main editor (extension shortcuts are
 //      otherwise only matched by the main editor component).
 //   2. Inspect tui.focusedComponent to decide where the transcript goes.
@@ -95,15 +104,9 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const SPINNER_INTERVAL_MS = 80;
 
 // Audio meter — a tiny rolling waveform rendered in the status row while recording.
-// Tweakable knobs:
-//   METER_CELLS       = how many bars wide
-//   METER_TICK_MS     = how often bars shift left (smaller = snappier, more renders)
-//   METER_FLOOR_DB    = level at which the bar is empty (more negative = more sensitive)
-//   METER_CEILING_DB  = level at which the bar is full (less negative = needs louder to peg)
 const METER_CELLS = 6;
 const METER_TICK_MS = 60;
 const PEAK_BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-// const PEAK_BLOCKS = ["⠀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣷", "⣿"];
 const METER_FLOOR_DB = -50;
 const METER_CEILING_DB = -10;
 
@@ -128,28 +131,47 @@ function rmsToBlock(rms: number): string {
   return PEAK_BLOCKS[idx]!;
 }
 
+/** Build a 16kHz / mono / 16-bit PCM WAV header and concatenate the payload. No file I/O. */
+function wavFromPcm16(pcm: Buffer): Buffer {
+  const numChannels = 1;
+  const bits = 16;
+  const sampleRate = AUDIO_SAMPLE_RATE;
+  const blockAlign = (numChannels * bits) / 8;
+  const byteRate = (sampleRate * numChannels * bits) / 8;
+  const dataSize = pcm.length;
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0, "ascii");
+  h.writeUInt32LE(36 + dataSize, 4);
+  h.write("WAVE", 8, "ascii");
+  h.write("fmt ", 12, "ascii");
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20); // PCM
+  h.writeUInt16LE(numChannels, 22);
+  h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(byteRate, 28);
+  h.writeUInt16LE(blockAlign, 32);
+  h.writeUInt16LE(bits, 34);
+  h.write("data", 36, "ascii");
+  h.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([h, pcm]);
+}
+
 export default function (pi: ExtensionAPI) {
   let state: State = "idle";
   let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
-  let ws: WebSocket | null = null;
-  let finals: string[] = [];
+  let transcribeProc: ChildProcessWithoutNullStreams | null = null;
+  let pcmChunks: Buffer[] = [];
   let activeCtx: ExtensionContext | null = null;
-  let flushed = false;
   let cancelled = false;
   let stopTimeout: NodeJS.Timeout | null = null;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let spinnerFrame = 0;
   // Session generation: incremented on every start and every cleanup. All
-  // rec/ws event handlers capture the generation they belong to and no-op
-  // when it's stale — otherwise a PREVIOUS session's socket erroring/closing
-  // late (e.g. one we aborted mid-handshake) would run cleanup() and tear
-  // down the CURRENT live session.
+  // async event handlers capture the generation they belong to and no-op
+  // when it's stale — otherwise a PREVIOUS session's process exiting late
+  // (e.g. one we aborted) would run cleanup() and tear down the CURRENT one.
   let generation = 0;
-  // Audio meter state. `meter` is a ring of recent RMS values, newest at
-  // index METER_CELLS-1. `currentLevel` is the most recent RMS observed from
-  // any audio chunk — the meter tick just samples it. Crucially we never reset
-  // it: empty ticks re-render the last observed value, so the bars never drop
-  // to silence just because no chunk happened to arrive in that 60ms window.
+  // Audio meter state (see startMeter).
   let meterTimer: NodeJS.Timeout | null = null;
   let meter: number[] = new Array(METER_CELLS).fill(0);
   let currentLevel = 0;
@@ -178,11 +200,6 @@ export default function (pi: ExtensionAPI) {
     stopMeter();
     meter = new Array(METER_CELLS).fill(0);
     currentLevel = 0;
-    // Recording dot: a text glyph colored via the theme, not an emoji — emoji
-    // presentation renders double-width in its own baked-in color and visually
-    // shouts in the footer. `●` is the same dot pi's own docs use for
-    // indicators; theme "error" gives the red. (If you ever want strictly
-    // ASCII, swap the glyph for "O".)
     const render = () => {
       const dot = activeCtx?.ui.theme.fg("error", "●") ?? "●";
       setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening…`);
@@ -214,56 +231,44 @@ export default function (pi: ExtensionAPI) {
   const resolveTarget = (): Target | null => {
     const focused = tuiHandle?.focusedComponent;
     if (!focused) return null;
-    // Editor-like focus: the main chat editor, custom editors, and the
-    // ctx.ui.editor()/input() popups (their inner pi-tui Editor hangs off
-    // `.editor`). These accept a guaranteed direct setText append.
     const editor = asEditorLike(focused) ?? asEditorLike(focused.editor);
     if (editor) return { kind: "editor", editor };
-    // Opaque component with input handling (quiz/ask selects, selectors):
-    // we can type into it, but whether the text lands depends on its
-    // internal focus (e.g. the quiz note field must be Tab-focused).
     if (typeof focused.handleInput === "function") return { kind: "typable", component: focused };
     return null;
   };
 
-  const flush = () => {
-    if (flushed || !activeCtx) return;
-    flushed = true;
-    if (cancelled) return; // discard transcript on cancel
-    const text = finals.join(" ").replace(/\s+/g, " ").trim();
-    if (!text) return;
+  /** Place the finished transcript in the focused field (or clipboard). */
+  const deliverTranscript = (text: string) => {
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (!clean || !activeCtx) return;
 
     // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
     // append to the main chat editor exactly as before.
     if (!tuiHandle) {
       const current = activeCtx.ui.getEditorText() ?? "";
       const sep = current && !/\s$/.test(current) ? " " : "";
-      activeCtx.ui.setEditorText(current + sep + text);
+      activeCtx.ui.setEditorText(current + sep + clean);
       return;
     }
 
-    // Resolve the target NOW — focus may have changed while dictating.
     const target = resolveTarget();
     if (target?.kind === "editor") {
       const current = target.editor.getText() ?? "";
       const sep = current && !/\s$/.test(current) ? " " : "";
-      target.editor.setText(current + sep + text);
+      target.editor.setText(current + sep + clean);
       tuiHandle.requestRender?.();
       return;
     }
     if (target?.kind === "typable") {
-      // Synthetic typing: the component routes the text wherever its
-      // internal focus is. Text is plain printable words (whitespace
-      // already normalized), so no keybindings/autocomplete can trigger.
-      target.component.handleInput(text);
+      target.component.handleInput(clean);
       tuiHandle.requestRender?.();
       return;
     }
-    // Nothing to type into: don't throw the transcript away — stash it on
-    // the clipboard and say so.
+    // Nothing to type into: don't throw the transcript away — stash it on the
+    // clipboard and say so.
     try {
-      const p = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      p.stdin.end(text);
+      const p = spawn(CLIP_CMD, [], { stdio: ["pipe", "ignore", "ignore"] });
+      p.stdin.end(clean);
     } catch {}
     activeCtx.ui.notify("Dictation finished but no input field is focused — transcript copied to clipboard", "warning");
   };
@@ -271,7 +276,6 @@ export default function (pi: ExtensionAPI) {
   const cleanup = () => {
     generation++; // invalidate the dying session's event handlers
     dbg(`cleanup → gen ${generation}`);
-    flush();
     stopSpinner();
     stopMeter();
     if (stopTimeout) {
@@ -284,60 +288,61 @@ export default function (pi: ExtensionAPI) {
       } catch {}
       rec = null;
     }
-    if (ws) {
+    if (transcribeProc) {
       try {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close();
-        }
+        transcribeProc.kill("SIGTERM");
       } catch {}
-      ws = null;
+      transcribeProc = null;
     }
-    finals = [];
+    pcmChunks = [];
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
-    flushed = false;
     cancelled = false;
   };
 
   const startDictation = (ctx: ExtensionContext) => {
-    const apiKey = process.env.DEEPGRAM_API_KEY;
-    if (!apiKey) {
-      ctx.ui.notify("DEEPGRAM_API_KEY not set in environment", "error");
+    // Model/CLI get an early existence check so the user learns a missing
+    // piece before talking (arecord surfaces as an ENOENT on spawn instead).
+    const hasModel = existsSync(WHISPER_MODEL);
+    if (!hasModel) {
+      ctx.ui.notify(`Whisper model not found: ${WHISPER_MODEL}`, "error");
+      return;
+    }
+    const knock = spawnSync(WHISPER_CLI, ["--version"], { stdio: "ignore" });
+    if (knock.error || knock.status !== 0) {
+      ctx.ui.notify(`whisper-cli not found — install whisper.cpp (${WHISPER_CLI})`, "error");
       return;
     }
 
     activeCtx = ctx;
-    finals = [];
-    flushed = false;
+    pcmChunks = [];
     cancelled = false;
     state = "recording";
     const myGeneration = ++generation;
     dbg(`start (gen ${myGeneration})`);
     startMeter();
 
-    // Spawn sox `rec` to capture 16kHz / 16-bit / mono PCM to stdout.
+    // Capture 16kHz / 16-bit / mono raw PCM from ALSA to stdout; we buffer it
+    // entirely in memory — no audio ever touches disk.
+    const devArgs = ARECORD_DEVICE ? ["-D", ARECORD_DEVICE] : [];
     let proc: ChildProcessByStdio<null, Readable, Readable>;
     try {
       proc = spawn(
-        "rec",
+        "arecord",
         [
-          "-q", // quiet
-          // Shrink sox's IO buffer so stdout flushes ~every 16ms instead of
-          // the default ~256ms. 512 bytes = 256 samples = 16ms at 16kHz/16-bit
-          // mono. This is the dominant source of meter latency.
-          "--buffer", "512",
-          "-r", "16000",
-          "-c", "1",
-          "-b", "16",
-          "-e", "signed-integer",
+          "-q",
           "-t", "raw",
-          "-", // stdout
+          "-f", "S16_LE",
+          "-r", String(AUDIO_SAMPLE_RATE),
+          "-c", "1",
+          ...devArgs,
+          "-",
         ],
         { stdio: ["ignore", "pipe", "pipe"] },
       );
     } catch (e: any) {
-      ctx.ui.notify(`Failed to spawn 'rec'. Install sox: brew install sox`, "error");
+      ctx.ui.notify(`Failed to spawn 'arecord'. Install alsa-utils: sudo apt install alsa-utils`, "error");
       cleanup();
       return;
     }
@@ -345,124 +350,103 @@ export default function (pi: ExtensionAPI) {
 
     proc.on("error", (err) => {
       if (myGeneration !== generation) return;
-      ctx.ui.notify(`rec error: ${err.message} (install sox: brew install sox)`, "error");
+      ctx.ui.notify(`arecord error: ${err.message} (install alsa-utils)`, "error");
       cleanup();
     });
 
     proc.on("exit", (code) => {
-      if (myGeneration !== generation) return; // stale recorder — a newer/ended session owns state
-      // Natural exit on SIGTERM during stopDictation is fine. Anything else
-      // mid-recording is a problem.
+      if (myGeneration !== generation) return; // stale recorder
       if (state === "recording" && code !== null && code !== 0) {
-        if (activeCtx) {
-          activeCtx.ui.notify(`rec exited unexpectedly (code ${code})`, "warning");
-        }
+        if (activeCtx) activeCtx.ui.notify(`arecord exited unexpectedly (code ${code})`, "warning");
         cleanup();
       }
     });
 
-    // Open Deepgram WebSocket. Auth via subprotocol (portable across Node native
-    // WebSocket and browsers): `new WebSocket(url, ["token", API_KEY])`.
-    try {
-      ws = new WebSocket(DG_URL, ["token", apiKey]);
-    } catch (e: any) {
-      ctx.ui.notify(`Deepgram WS failed: ${e.message}`, "error");
-      cleanup();
-      return;
-    }
-
-    ws.addEventListener("open", () => {
-      if (myGeneration !== generation) {
-        dbg(`ws open (stale gen ${myGeneration}, current ${generation}) — ignored`);
-        return;
-      }
-      dbg(`ws open (gen ${myGeneration})`);
-      if (!rec || !ws) return;
-      rec.stdout.on("data", (chunk: Buffer) => {
-        // Track loudness for the meter (just the latest chunk's RMS — the meter
-        // tick samples this), then forward to Deepgram.
-        currentLevel = rmsFromPcm16(chunk);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(chunk);
-        }
-      });
-    });
-
-    ws.addEventListener("message", (ev) => {
-      if (myGeneration !== generation) return;
-      try {
-        const msg = JSON.parse(ev.data as string);
-        if (msg.type === "Results" && msg.is_final) {
-          const t = msg.channel?.alternatives?.[0]?.transcript;
-          if (t) finals.push(t);
-        }
-        // We could also handle msg.type === "Metadata" (sent after CloseStream
-        // finishes draining), but ws.close handles the same flush path.
-      } catch {
-        // ignore non-JSON frames
-      }
-    });
-
-    ws.addEventListener("error", () => {
-      if (myGeneration !== generation) {
-        dbg(`ws error (stale gen ${myGeneration}, current ${generation}) — ignored`);
-        return;
-      }
-      dbg(`ws error (gen ${myGeneration})`);
-      if (activeCtx) activeCtx.ui.notify("Deepgram WebSocket error", "error");
-      cleanup();
-    });
-
-    ws.addEventListener("close", (ev) => {
-      if (myGeneration !== generation) {
-        dbg(`ws close (stale gen ${myGeneration}, current ${generation}, code ${ev.code}) — ignored`);
-        return;
-      }
-      dbg(`ws close (gen ${myGeneration}, code ${ev.code})`);
-      // Server-initiated close (or our own close in cleanup): finalize.
-      if (state === "recording" || state === "stopping") {
-        cleanup();
-      }
+    proc.stdout.on("data", (chunk: Buffer) => {
+      currentLevel = rmsFromPcm16(chunk);
+      pcmChunks.push(chunk);
     });
   };
 
-  /** Stop dictation, finalize transcript, append to editor. */
+  /** Stop dictation, transcribe locally, deliver the text. */
   const stopDictation = () => {
     if (state !== "recording") return;
     state = "stopping";
     stopMeter();
-    startSpinner("finalizing…");
+    startSpinner("transcribing…");
 
-    // Stop the mic first so no more audio enqueues.
+    // Stop the mic first so no more audio accumulates.
     if (rec) {
       try {
         rec.kill("SIGTERM");
       } catch {}
     }
 
-    // Tell Deepgram we're done; it will flush remaining finals then close.
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: "CloseStream" }));
-      } catch {
-        cleanup();
-        return;
-      }
-      // Safety net: if Deepgram never closes the socket, force cleanup after 3s.
-      stopTimeout = setTimeout(() => {
-        if (state === "stopping") cleanup();
-      }, 3000);
-    } else {
+    const myGeneration = generation;
+    const data = Buffer.concat(pcmChunks);
+    pcmChunks = [];
+    if (data.length === 0) {
       cleanup();
+      if (activeCtx) activeCtx.ui.notify("No audio captured", "warning");
+      return;
     }
+    const wav = wavFromPcm16(data);
+
+    // Pipe the in-memory WAV into whisper-cli stdin; nothing is written to disk.
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(
+        WHISPER_CLI,
+        ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-ngl", String(WHISPER_GPU_LAYERS)],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+    } catch (e: any) {
+      if (activeCtx) activeCtx.ui.notify(`whisper-cli failed to spawn: ${e.message}`, "error");
+      cleanup();
+      return;
+    }
+    transcribeProc = proc;
+
+    const out: Buffer[] = [];
+    proc.stdout.on("data", (c: Buffer) => out.push(c));
+    proc.stderr.on("data", () => {}); // swallow progress/noise
+
+    proc.on("error", (e) => {
+      if (myGeneration !== generation) return;
+      if (activeCtx) activeCtx.ui.notify(`whisper-cli error: ${e.message}`, "error");
+      cleanup();
+    });
+
+    proc.on("exit", (code) => {
+      if (myGeneration !== generation) return; // stale transcription
+      const text = Buffer.concat(out).toString().trim();
+      if (code !== 0 && !text) {
+        if (activeCtx) activeCtx.ui.notify(`whisper failed (code ${code})`, "error");
+      } else if (text) {
+        deliverTranscript(text);
+      }
+      cleanup();
+    });
+
+    proc.stdin.end(wav);
+
+    // Safety net: if whisper never exits, force cleanup (delivering whatever
+    // came through) and surface a warning.
+    stopTimeout = setTimeout(() => {
+      if (state !== "stopping") return;
+      if (myGeneration !== generation) return;
+      const text = Buffer.concat(out).toString().trim();
+      if (text) deliverTranscript(text);
+      else if (activeCtx) activeCtx.ui.notify("Transcription timed out", "warning");
+      cleanup();
+    }, STT_TIMEOUT_MS);
   };
 
-  /** Cancel dictation: discard any collected transcript and tear everything down immediately. */
+  /** Cancel dictation: discard any collected audio and tear everything down immediately. */
   const cancelDictation = () => {
     if (state !== "recording" && state !== "stopping") return;
     cancelled = true;
-    finals = [];
-    // No need to wait for Deepgram to flush — we're throwing the result away.
+    pcmChunks = [];
     cleanup();
   };
 
@@ -478,24 +462,16 @@ export default function (pi: ExtensionAPI) {
     } else if (state === "recording") {
       stopDictation();
     }
-    // Ignore presses during the "stopping" state — Deepgram is finalizing.
+    // Ignore presses during the "stopping" state — whisper is transcribing.
   };
 
-  // Global input listener: catches alt+m/alt+n before ANY focused component,
+  // Global input listener: catches alt+k/alt+n before ANY focused component,
   // which is what makes dictation work inside dialogs. Registered once the
   // TUI handle is captured (see session_start below).
   const onGlobalInput = (data: string) => {
-    // Kitty flag-2 terminals send press + REPEAT + RELEASE events, and input
-    // listeners run BEFORE the TUI's release filter (that filter only guards
-    // dispatch to the focused component). matchesKey also ignores the Kitty
-    // event type. Without this guard a single physical alt+m press toggles
-    // TWICE: press starts dictation, release instantly stops it and closes
-    // the WebSocket mid-handshake — which then surfaces as
-    // "Deepgram WebSocket error" (and its stale error event can kill the NEXT
-    // session). Filter to press events only.
     if (isKeyRelease(data) || isKeyRepeat(data)) return undefined;
-    if (matchesKey(data, Key.alt("m"))) {
-      dbg(`alt+m (data=${JSON.stringify(data)}) state=${state}`);
+    if (matchesKey(data, Key.alt("k"))) {
+      dbg(`alt+k (data=${JSON.stringify(data)}) state=${state}`);
       if (lastCtx) toggleDictation(lastCtx);
       return { consume: true };
     }
@@ -510,9 +486,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
     if (ctx.mode !== "tui" || tuiHandle) return;
-    // Capture the TUI handle via an invisible zero-height widget. The
-    // listener function reference is stable, so even if the factory re-runs
-    // the TUI's listener Set de-dupes it.
     ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
       tuiHandle = tui;
       removeInputListener = tui.addInputListener(onGlobalInput);
@@ -524,8 +497,8 @@ export default function (pi: ExtensionAPI) {
   // handle was never captured (non-TUI modes, older pi): they only fire when
   // the main editor is focused, but that's precisely the legacy path. When
   // the listener IS installed it consumes the key first, so no double-fire.
-  pi.registerShortcut(Key.alt("m"), {
-    description: "Toggle voice dictation (Deepgram)",
+  pi.registerShortcut(Key.alt("k"), {
+    description: "Toggle voice dictation (local whisper.cpp)",
     handler: async (ctx) => {
       toggleDictation(ctx);
     },
