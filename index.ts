@@ -476,18 +476,21 @@ export default function (pi: ExtensionAPI) {
         if (activeCtx) {
           const err = errTail.trim();
           const stderrMatchesError = /error|failed|fail|alloc|out of memory|oom|not found|bad|invalid|missing/i.test(err);
+          let msg: string;
           // Empty output + exit 0 but stderr screams backend failure → say so,
           // not "no speech" (a mislabel that sends the user at the mic).
-          const msg =
-            code === null
-              ? "Transcription timed out"
-              : code === 0
-                ? stderrMatchesError && err
-                  ? `Whisper backend error: ${err.slice(0, 160)}`
-                  : "No speech detected — check the mic (ARECORD_DEVICE)"
-                : err
-                  ? `whisper failed (code ${code}): ${err.slice(0, 160)}`
-                  : `whisper failed (code ${code})`;
+          if (code === null) {
+            msg = "Transcription timed out";
+          } else if (code === 0) {
+            msg =
+              stderrMatchesError && err
+                ? `Whisper backend error: ${err.slice(0, 160)}`
+                : "No speech detected — check the mic (ARECORD_DEVICE)";
+          } else if (err) {
+            msg = `whisper failed (code ${code}): ${err.slice(0, 160)}`;
+          } else {
+            msg = `whisper failed (code ${code})`;
+          }
           activeCtx.ui.notify(msg, "warning");
         }
         cleanup();
@@ -624,5 +627,9 @@ export default function (pi: ExtensionAPI) {
     if (state !== "idle") cleanup();
     removeInputListener?.();
     removeInputListener = null;
+    // Reset the captured handle so a later session reinstalls the global input
+    // listener — otherwise session_start early-returns on `tuiHandle` and the
+    // "works anywhere in pi" dialog path dies until /reload.
+    tuiHandle = null;
   });
 }
