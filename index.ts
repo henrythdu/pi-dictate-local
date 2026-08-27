@@ -78,10 +78,10 @@ const GPU_ON = WHISPER_GPU_LAYERS > 0;
 const STT_TIMEOUT_MS = Number(process.env.DICTATE_STT_TIMEOUT_MS ?? 15000);
 const ARECORD_DEVICE = process.env.ARECORD_DEVICE ?? "";
 const CLIP_CMD = process.env.DICTATE_CLIP_CMD ?? "wl-copy";
-// Diagnostics: when /tmp/dictate-dump-on exists, dump the exact WAV the
-// extension would transcribe to /tmp/dictate-dump.wav on every stop.
-// Checked at stop time (not load time) so no pi restart is needed.
-const DUMP_WAV = () => existsSync("/tmp/dictate-dump-on");
+// Diagnostics: when DICTATE_DUMP_WAV=1 is set when pi loads, dump the exact
+// WAV the extension would transcribe to /tmp/dictate-dump.wav on every stop.
+// Off by default (the "no audio on disk" guarantee holds).
+const DUMP_WAV = !!process.env.DICTATE_DUMP_WAV;
 
 const AUDIO_SAMPLE_RATE = 16000;
 
@@ -401,7 +401,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const wav = wavFromPcm16(data);
-    if (DUMP_WAV()) {
+    if (DUMP_WAV) {
       try {
         appendFileSync("/tmp/dictate-dump.wav", wav);
         dbg(`dumped ${data.length} PCM bytes → /tmp/dictate-dump.wav`);
@@ -474,13 +474,16 @@ export default function (pi: ExtensionAPI) {
       proc.on("exit", (code) => {
         if (settled) return;
         settled = true;
+        // Always clean up the temp fd/file first — even on a stale run (cancel
+        // / shutdown during transcription). Without this the exit handler's
+        // early return on stale-generation leaked the fd + temp file.
+        const text = finishOut();
         if (myGeneration !== generation) return; // stale transcription
         if (stopTimeout) {
           clearTimeout(stopTimeout);
           stopTimeout = null;
         }
         // Read AFTER exit — stdout is block-buffered; a mid-run read is stale/empty.
-        const text = finishOut();
         dbg(`stt exit code=${code} cpu=${forceCpu} text=${text.slice(0, 80)}`);
         if (text) {
           deliverTranscript(text);
