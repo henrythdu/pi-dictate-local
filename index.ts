@@ -77,9 +77,10 @@ const GPU_ON = WHISPER_GPU_LAYERS > 0;
 const STT_TIMEOUT_MS = Number(process.env.DICTATE_STT_TIMEOUT_MS ?? 15000);
 const ARECORD_DEVICE = process.env.ARECORD_DEVICE ?? "";
 const CLIP_CMD = process.env.DICTATE_CLIP_CMD ?? "wl-copy";
-// Diagnostics: dump the exact WAV the extension would transcribe to
-// /tmp/dictate-dump.wav on every stop. Analyze offline; remove in prod.
-const DUMP_WAV = !!process.env.DICTATE_DUMP_WAV;
+// Diagnostics: when /tmp/dictate-dump-on exists, dump the exact WAV the
+// extension would transcribe to /tmp/dictate-dump.wav on every stop.
+// Checked at stop time (not load time) so no pi restart is needed.
+const DUMP_WAV = () => existsSync("/tmp/dictate-dump-on");
 
 const AUDIO_SAMPLE_RATE = 16000;
 
@@ -398,7 +399,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const wav = wavFromPcm16(data);
-    if (DUMP_WAV) {
+    if (DUMP_WAV()) {
       try {
         appendFileSync("/tmp/dictate-dump.wav", wav);
         dbg(`dumped ${data.length} PCM bytes → /tmp/dictate-dump.wav`);
