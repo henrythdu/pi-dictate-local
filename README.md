@@ -14,7 +14,7 @@ Minimal **local** voice dictation for pi. Runs entirely on your machine via **wh
 ## Why local
 
 - **No paid API.** Your voice never leaves the machine; there are no recurring costs and no API key.
-- **No audio artifacts.** The take lives only in RAM for the ~second it takes to transcribe, then is discarded. Nothing is ever written to disk.
+- **No audio artifacts.** The take lives only in RAM for the ~second it takes to transcribe, then is discarded. Only a tiny transcript text file is written transiently (and deleted); no audio ever touches disk.
 
 ## Install
 
@@ -59,8 +59,8 @@ Run `/reload` in pi after first install (or after editing `index.ts`) to pick up
 ## How it works
 
 - While recording, the extension spawns `arecord` capturing 16kHz mono 16-bit PCM and buffers it **entirely in RAM** (a short dictation is ~1MB — trivial). Each chunk's RMS drives the live level meter.
-- On stop, it kills the recorder and builds a standard WAV header in memory, then spawns `whisper-cli -m <model> -f - -nt -of - -otxt` (adding `-ng` when GPU is disabled) and pipes the WAV in via **stdin** — no temp file.
-- `-nt -of - -otxt` prints the plain transcript (no timestamps) to stdout (newer whisper.cpp needs explicit `-otxt -of -` to emit text); the extension collects it, then delivers it through pi's focus-aware path:
+- On stop, it kills the recorder and builds a standard WAV header in memory, then spawns `whisper-cli -m <model> -f - -nt -of - -otxt` (adding `-ng` when GPU is disabled) and pipes the WAV in via **stdin** — no audio file is written.
+- The transcript is written to stdout; the extension routes it to a temp file descriptor and reads the text back after the process exits (whisper-cli won't emit text to a Node-created pipe), then delivers it through pi's focus-aware path:
   - editor-like components (`.getText`/`.setText`, including popups' inner `.editor`) get a direct append;
   - opaque components get the text as synthetic keystrokes routed by their own focus logic;
   - nothing focused → clipboard + a notification.
