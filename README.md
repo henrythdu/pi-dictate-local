@@ -86,9 +86,7 @@ All knobs are at the top of `index.ts`, and most are env-overridable:
 
 ## Why `alt+k` / `alt+n` (and tmux)
 
-`alt+m` is taken by the **pi-intercom** extension (opens its session intercom overlay), so dictation lives on `alt+k` (toggle) and `alt+n` (cancel).
-
-Both are `alt`-based because **`ctrl+shift+<letter>` is not representable as a legacy terminal byte** — adding Shift to `Ctrl+M` doesn't change the byte, so `Ctrl+Shift+M` is indistinguishable from `Ctrl+M` (i.e. `\r` = Enter). That means inside **tmux** (which doesn't pass through the Kitty keyboard protocol, and only forwards modified keys when `extended-keys` is on — it's off by default), `ctrl+shift+k` would collapse to `Ctrl+K`. `alt+<letter>` has a distinct legacy byte (`Alt+K` → `ESC k`), which tmux forwards even without `extended-keys`, so the binding works both inside and outside tmux.
+These are `alt`-based because **`ctrl+shift+<letter>` is not representable as a legacy terminal byte** — adding Shift to `Ctrl+M` doesn't change the byte, so `Ctrl+Shift+M` is indistinguishable from `Ctrl+M` (i.e. `\r` = Enter). That means inside **tmux** (which doesn't pass through the Kitty keyboard protocol, and only forwards modified keys when `extended-keys` is on — it's off by default), `ctrl+shift+k` would collapse to `Ctrl+K`. `alt+<letter>` has a distinct legacy byte (`Alt+K` → `ESC k`), which tmux forwards even without `extended-keys`, so the binding works both inside and outside tmux.
 
 On macOS, your terminal must treat Option as Alt/Meta (pi already requires this for its own `alt+enter` follow-up and `alt+up` dequeue bindings). Ghostty does this by default; in iTerm2 set Profile → Keys → Left/Right Option key → `Esc+`.
 
