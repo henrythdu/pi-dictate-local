@@ -398,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 
     // Pipe the in-memory WAV into whisper-cli stdin; nothing is written to disk.
     let proc: ChildProcessWithoutNullStreams;
-    const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt"];
+    const args = ["-m", WHISPER_MODEL, "-f", "-", "-nt", "-of", "-", "-otxt"];
     if (!GPU_ON) args.push("-ng"); // run fully on CPU instead of GPU
     try {
       proc = spawn(WHISPER_CLI, args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -422,10 +422,15 @@ export default function (pi: ExtensionAPI) {
     proc.on("exit", (code) => {
       if (myGeneration !== generation) return; // stale transcription
       const text = Buffer.concat(out).toString().trim();
-      if (code !== 0 && !text) {
-        if (activeCtx) activeCtx.ui.notify(`whisper failed (code ${code})`, "error");
-      } else if (text) {
+      if (text) {
         deliverTranscript(text);
+      } else if (activeCtx) {
+        // Empty transcript: transcribe on silence used to fail silently —
+        // surface it instead so mic problems are diagnosable.
+        activeCtx.ui.notify(
+          code === 0 ? "No speech detected — check the mic (ARECORD_DEVICE)" : `whisper failed (code ${code})`,
+          "warning",
+        );
       }
       cleanup();
     });

@@ -59,8 +59,8 @@ Run `/reload` in pi after first install (or after editing `index.ts`) to pick up
 ## How it works
 
 - While recording, the extension spawns `arecord` capturing 16kHz mono 16-bit PCM and buffers it **entirely in RAM** (a short dictation is ~1MB — trivial). Each chunk's RMS drives the live level meter.
-- On stop, it kills the recorder and builds a standard WAV header in memory, then spawns `whisper-cli -m <model> -f - -nt` (adding `-ng` when GPU is disabled) and pipes the WAV in via **stdin** — no temp file.
-- `-nt` prints the plain transcript (no timestamps) to stdout; the extension collects it, then delivers it through pi's focus-aware path:
+- On stop, it kills the recorder and builds a standard WAV header in memory, then spawns `whisper-cli -m <model> -f - -nt -of - -otxt` (adding `-ng` when GPU is disabled) and pipes the WAV in via **stdin** — no temp file.
+- `-nt -of - -otxt` prints the plain transcript (no timestamps) to stdout (newer whisper.cpp needs explicit `-otxt -of -` to emit text); the extension collects it, then delivers it through pi's focus-aware path:
   - editor-like components (`.getText`/`.setText`, including popups' inner `.editor`) get a direct append;
   - opaque components get the text as synthetic keystrokes routed by their own focus logic;
   - nothing focused → clipboard + a notification.
@@ -99,7 +99,7 @@ If you prefer different bindings, edit the `registerShortcut` calls at the botto
 - **"arecord error / Failed to spawn 'arecord'"** — `sudo apt install alsa-utils`; verify with `which arecord`. If the default device isn't your mic, set `ARECORD_DEVICE` (find names with `arecord -l`).
 - **No mic input** — first check the level meter: if the bars stay flat while you talk, no audio is reaching arecord. Linux may need mic access granted to your terminal/desktop environment.
 - **Slow transcription** — set `WHISPER_GPU_LAYERS=0` for pure CPU, or use a GPU build/model; a CPU `whisper-cli` build works fine, just slower on long takes.
-- **'whisper failed (code …)'** — usually a GPU/model issue; run `whisper-cli -m <model> -f - -nt` manually to see stderr.
+- **'whisper failed (code …)' / "No speech detected"** — run `whisper-cli -m <model> -f - -nt -of - -otxt` manually to see stderr. "No speech detected" means the mic captured silence — check `ARECORD_DEVICE`.
 - **Nothing happens after stop** — check `DICTATE_DEBUG=1` and the `/tmp/dictate-debug.log`. If you saw "no input field is focused", the transcript was copied to the clipboard — paste with Ctrl+V (or ⌘V on mac).
 - **Dictated text vanished into a quiz/ask dialog** — the dialog's option list (not its text field) had focus. Tab into the note/Other field before toggling dictation.
 - **`alt+k` inserts `µ` instead of toggling** (macOS) — your terminal isn't treating Option as Alt. In iTerm2: Profile → Keys → Left/Right Option key → `Esc+`. (Ghostty/Kitty/WezTerm do this by default.)
