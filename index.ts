@@ -36,8 +36,9 @@
  * Tuning (all env-overridable):
  *   WHISPER_CLI            path to whisper-cli (default: "whisper-cli" on PATH)
  *   WHISPER_MODEL          path to the ggml model (default: ~/.cache/whisper/ggml-small.en.bin)
- *   WHISPER_GPU_LAYERS     -ngl layers offloaded to GPU (default 24; set 0 = full CPU,
- *                           lower if it must share VRAM with LM Studio)
+ *   WHISPER_GPU_LAYERS     GPU off: 0 = full CPU (-ng). whisper.cpp >=1.9 has no
+ *                           layer-granular offload (the old -ngl was removed),
+ *                           so this is a binary GPU/CPU switch (default >0 = GPU).
  *   DICTATE_STT_TIMEOUT_MS safety timeout for a hung transcription (default 15000)
  *   ARECORD_DEVICE         ALSA device for arecord -D (default: system default)
  *   DICTATE_CLIP_CMD       clipboard fallback command (default: wl-copy, Linux; pbcopy on mac)
@@ -171,7 +172,6 @@ export default function (pi: ExtensionAPI) {
   let transcribeProc: ChildProcess | null = null;
   let pcmChunks: Buffer[] = [];
   let activeCtx: ExtensionContext | null = null;
-  let cancelled = false;
   let stopTimeout: NodeJS.Timeout | null = null;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let spinnerFrame = 0;
@@ -307,7 +307,6 @@ export default function (pi: ExtensionAPI) {
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
-    cancelled = false;
   };
 
   const startDictation = (ctx: ExtensionContext) => {
@@ -326,7 +325,6 @@ export default function (pi: ExtensionAPI) {
 
     activeCtx = ctx;
     pcmChunks = [];
-    cancelled = false;
     state = "recording";
     const myGeneration = ++generation;
     dbg(`start (gen ${myGeneration})`);
@@ -408,10 +406,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Pipe the in-memory WAV into whisper-cli stdin; nothing is written to disk.
-    // whisper.cpp's CUDA backend can intermittently return an EMPTY transcript
-    // on audio the encoder's F16 path is weak on (known flaky encoder bug class,
-    // worsens under GPU contention). If the GPU run comes back empty, retry
-    // once on CPU (-ng) before concluding there was no speech.
+    // whisper will not write its transcript to a Node-created stdout pipe (the
+    // empty-output bug, fixed below), so we route stdout to a real fd. The
+    // GPU→CPU retry on empty output is cheap regression insurance — the empty
+    // transcript was actually the stdout-pipe bug, not the encoder, so a GPU
+    // empty should be rare. Revisit after a week of real use.
     if (stopTimeout) {
       clearTimeout(stopTimeout);
       stopTimeout = null;
@@ -457,6 +456,11 @@ export default function (pi: ExtensionAPI) {
       // Shared post-fetch settle: delivers the transcript on success, retries
       // once on CPU if the GPU run came back empty, else notifies. Both the
       // exit and timeout paths converge here so the logic lives once.
+      // Last ~4KB of stderr, kept for honest error attribution. whisper's
+      // stderr is verbose on SUCCESS too (model-load banner), so we only
+      // surface it when there was a failure (empty text or nonzero exit).
+      let errTail = "";
+
       const settleAndHandle = (text: string, code: number | null, mode: "exit" | "timeout") => {
         if (text) {
           deliverTranscript(text);
@@ -470,14 +474,21 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (activeCtx) {
-          activeCtx.ui.notify(
+          const err = errTail.trim();
+          const stderrMatchesError = /error|failed|fail|alloc|out of memory|oom|not found|bad|invalid|missing/i.test(err);
+          // Empty output + exit 0 but stderr screams backend failure → say so,
+          // not "no speech" (a mislabel that sends the user at the mic).
+          const msg =
             code === null
               ? "Transcription timed out"
               : code === 0
-                ? "No speech detected — check the mic (ARECORD_DEVICE)"
-                : `whisper failed (code ${code})`,
-            "warning",
-          );
+                ? stderrMatchesError && err
+                  ? `Whisper backend error: ${err.slice(0, 160)}`
+                  : "No speech detected — check the mic (ARECORD_DEVICE)"
+                : err
+                  ? `whisper failed (code ${code}): ${err.slice(0, 160)}`
+                  : `whisper failed (code ${code})`;
+          activeCtx.ui.notify(msg, "warning");
         }
         cleanup();
       };
@@ -486,8 +497,11 @@ export default function (pi: ExtensionAPI) {
       // process — without this guard we'd double-retry/double-deliver.
       let settled = false;
 
-      // stderr is still a pipe (progress/noise) but we swallow it.
-      proc.stderr!.on("data", () => {});
+      // stderr still flows (progress/noise) but we only keep the tail so a
+      // real backend error can be surfaced instead of a mislabeled "no speech".
+      proc.stderr!.on("data", (c: Buffer) => {
+        errTail = ((errTail + c.toString()).slice(-4096));
+      });
 
       proc.on("error", (e) => {
         if (settled) return;
@@ -539,7 +553,6 @@ export default function (pi: ExtensionAPI) {
   /** Cancel dictation: discard any collected audio and tear everything down immediately. */
   const cancelDictation = () => {
     if (state !== "recording" && state !== "stopping") return;
-    cancelled = true;
     pcmChunks = [];
     cleanup();
   };
