@@ -166,7 +166,6 @@ function wavFromPcm16(pcm: Buffer): Buffer {
 }
 
 export default function (pi: ExtensionAPI) {
-  let sttSeq = 0; // unique temp transcript file per STT run (retries included)
   let state: State = "idle";
   let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
   let transcribeProc: ChildProcess | null = null;
@@ -426,7 +425,7 @@ export default function (pi: ExtensionAPI) {
       // to a temp file fd and read it back after exit. Audio still flows via
       // the stdin pipe (works), so nothing but the tiny transcript text ever
       // touches disk — no audio files.
-      const outPath = `${tmpdir()}/dictate-transcript-${process.pid}-${sttSeq++}.txt`;
+      const outPath = `${tmpdir()}/dictate-transcript-${process.pid}.txt`;
       let outFd: number;
       try {
         outFd = openSync(outPath, "w");
@@ -453,6 +452,34 @@ export default function (pi: ExtensionAPI) {
         try { text = readFileSync(outPath, "utf8").trim(); } catch {}
         try { unlinkSync(outPath); } catch {}
         return text;
+      };
+
+      // Shared post-fetch settle: delivers the transcript on success, retries
+      // once on CPU if the GPU run came back empty, else notifies. Both the
+      // exit and timeout paths converge here so the logic lives once.
+      const settleAndHandle = (text: string, code: number | null, mode: "exit" | "timeout") => {
+        if (text) {
+          deliverTranscript(text);
+          cleanup();
+          return;
+        }
+        if (GPU_ON && !forceCpu) {
+          dbg(mode === "timeout" ? "GPU timed out → retrying on CPU" : "empty GPU transcript → retrying on CPU");
+          startSpinner(mode === "timeout" ? "GPU timed out — retrying on CPU…" : "empty GPU output — retrying on CPU…");
+          spawnStt(true);
+          return;
+        }
+        if (activeCtx) {
+          activeCtx.ui.notify(
+            code === null
+              ? "Transcription timed out"
+              : code === 0
+                ? "No speech detected — check the mic (ARECORD_DEVICE)"
+                : `whisper failed (code ${code})`,
+            "warning",
+          );
+        }
+        cleanup();
       };
 
       // One-shot per run: the timeout also fires `exit` when it kills the
@@ -485,25 +512,7 @@ export default function (pi: ExtensionAPI) {
         }
         // Read AFTER exit — stdout is block-buffered; a mid-run read is stale/empty.
         dbg(`stt exit code=${code} cpu=${forceCpu} text=${text.slice(0, 80)}`);
-        if (text) {
-          deliverTranscript(text);
-          cleanup();
-          return;
-        }
-        // Empty output. Single retry on CPU when GPU was used.
-        if (GPU_ON && !forceCpu) {
-          dbg("empty GPU transcript → retrying on CPU");
-          startSpinner("empty GPU output — retrying on CPU…");
-          spawnStt(true);
-          return;
-        }
-        if (activeCtx) {
-          activeCtx.ui.notify(
-            code === 0 ? "No speech detected — check the mic (ARECORD_DEVICE)" : `whisper failed (code ${code})`,
-            "warning",
-          );
-        }
-        cleanup();
+        settleAndHandle(text, code, "exit");
       });
 
       proc.stdin!.end(wav);
@@ -520,20 +529,7 @@ export default function (pi: ExtensionAPI) {
             transcribeProc.kill("SIGTERM");
           } catch {}
         }
-        const text = finishOut();
-        if (text) {
-          deliverTranscript(text);
-          cleanup();
-          return;
-        }
-        if (GPU_ON && !forceCpu) {
-          dbg("GPU transcription timed out → retrying on CPU");
-          startSpinner("GPU timed out — retrying on CPU…");
-          spawnStt(true);
-          return;
-        }
-        if (activeCtx) activeCtx.ui.notify("Transcription timed out", "warning");
-        cleanup();
+        settleAndHandle(finishOut(), null, "timeout");
       }, STT_TIMEOUT_MS);
     };
 

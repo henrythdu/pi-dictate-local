@@ -1,6 +1,6 @@
 # dictate
 
-Minimal **local** voice dictation for pi. Runs entirely on your machine via **whisper.cpp** — no cloud, no paid API, and no audio is ever written to disk. No floating bubbles, no menu bar app, no notifications.
+Minimal **local** voice dictation for pi. Runs entirely on your machine via **whisper.cpp** — no cloud, no paid API, and no audio is ever written to disk (unless you opt into the `DICTATE_DUMP_WAV` debug flag). No floating bubbles, no menu bar app, no notifications.
 
 - **Toggle:** `alt+k` (press to start, press again to stop) — works **anywhere in pi**, not just the main chat input: quiz popups, `ask_user_question`, `ctx.ui.editor()`/`input()` dialogs, selectors. The key is intercepted at the TUI input layer, before whatever component has focus.
 - **Cancel:** `alt+n` (discard the in-flight recording; safe to press anytime, no-op when nothing is recording)
@@ -14,7 +14,7 @@ Minimal **local** voice dictation for pi. Runs entirely on your machine via **wh
 ## Why local
 
 - **No paid API.** Your voice never leaves the machine; there are no recurring costs and no API key.
-- **No audio artifacts.** The take lives only in RAM for the ~second it takes to transcribe, then is discarded. Only a tiny transcript text file is written transiently (and deleted); no audio ever touches disk.
+- **No audio artifacts.** The take lives only in RAM for the ~second it takes to transcribe, then is discarded. Only a tiny transcript text file is written transiently (and deleted); no audio ever touches disk (unless you set `DICTATE_DUMP_WAV=1`).
 
 ## Install
 
@@ -79,6 +79,7 @@ All knobs are at the top of `index.ts`, and most are env-overridable:
 | `ARECORD_DEVICE` | (default `-D`) | ALSA capture device if the default isn't your mic |
 | `DICTATE_CLIP_CMD` | `wl-copy` | clipboard fallback command |
 | `DICTATE_DEBUG` | off | append lifecycle log to `/tmp/dictate-debug.log` |
+| `DICTATE_DUMP_WAV` | off | debug: dump the exact transcribed WAV to `/tmp/dictate-dump.wav` |
 
 - **Hotkey:** change the `Key.alt("k")` / `Key.alt("n")` references near the bottom (the input listener `onGlobalInput` and the fallback `pi.registerShortcut` calls).
 - **Model:** edit `WHISPER_MODEL` (or set the env var) — swap `ggml-small.en` for `base.en`, `medium.en`, etc. Only affects download size and accuracy; GPU latency is negligible either way.
